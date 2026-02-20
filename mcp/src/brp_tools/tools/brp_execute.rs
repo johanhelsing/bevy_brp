@@ -1,6 +1,8 @@
 //! `brp_execute` allows for executing an arbitrary BRP method - generally this is used as a
-//! debugging tool for his MCP server but can also be used if (for example) a new brp method is
-//! added before it's been implemented in this server code.
+//! debugging tool for this MCP server but can also be used to call custom methods registered
+//! by the application (e.g., `my_game/spawn_enemy`).
+use std::time::Duration;
+
 use async_trait::async_trait;
 use bevy_brp_mcp_macros::ParamStruct;
 use bevy_brp_mcp_macros::ResultStruct;
@@ -9,17 +11,14 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::brp_tools::BrpClient;
 use crate::brp_tools::Port;
-use crate::brp_tools::ResponseStatus;
 use crate::error::Error;
-use crate::tool::BrpMethod;
 use crate::tool::ToolFn;
 
 #[derive(Clone, Deserialize, Serialize, JsonSchema, ParamStruct)]
 pub struct ExecuteParams {
-    /// The BRP method to execute (e.g., `rpc.discover`, `world.get_components`, `world.query`)
-    pub method: BrpMethod,
+    /// The BRP method to execute (e.g., `rpc.discover`, `world.get_components`, `my_game/do_thing`)
+    pub method: String,
     /// Optional parameters for the method
     #[to_metadata(skip_if_none)]
     pub params: Option<serde_json::Value>,
@@ -50,18 +49,44 @@ impl ToolFn for BrpExecute {
     type Params = ExecuteParams;
 
     async fn handle_impl(&self, params: ExecuteParams) -> crate::error::Result<ExecuteResult> {
-        let client = BrpClient::new(
-            params.method,         // Direct use of typed BRP method
-            params.port,           // Use typed port parameter
-            params.params.clone(), // User-provided params (already Option<Value>)
-        );
+        // Build JSON-RPC request directly so we can pass arbitrary method strings
+        // (BrpClient requires the typed BrpMethod enum)
+        let url = format!("http://127.0.0.1:{}/jsonrpc", params.port);
 
-        let brp_result = client.execute_raw().await?;
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": params.method,
+            "id": 1,
+            "params": params.params,
+        });
 
-        // Convert BRP result to ExecuteResult
-        match brp_result {
-            ResponseStatus::Success(data) => Ok(ExecuteResult::new(data)),
-            ResponseStatus::Error(err) => Err(Error::tool_call_failed(err.get_message()).into()),
+        let response = reqwest::Client::new()
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .body(body.to_string())
+            .timeout(Duration::from_secs(30))
+            .send()
+            .await
+            .map_err(|e| {
+                Error::tool_call_failed(format!(
+                    "HTTP request failed for {} on port {}: {e}",
+                    params.method, params.port
+                ))
+            })?;
+
+        let response_json: Value = response.json().await.map_err(|e| {
+            Error::tool_call_failed(format!("Failed to parse BRP response: {e}"))
+        })?;
+
+        if let Some(error) = response_json.get("error") {
+            let message = error
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("Unknown BRP error");
+            Err(Error::tool_call_failed(message).into())
+        } else {
+            let result = response_json.get("result").cloned();
+            Ok(ExecuteResult::new(result))
         }
     }
 }
