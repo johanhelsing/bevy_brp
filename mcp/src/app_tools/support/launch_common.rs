@@ -302,10 +302,24 @@ pub fn build_cargo_example_command(
     cmd
 }
 
-/// Build command for running app binaries
-pub fn build_app_command(binary_path: &Path, port: Option<Port>) -> Command {
-    let mut cmd = Command::new(binary_path);
+/// Build cargo command for running app binaries via `cargo run --bin`.
+///
+/// Uses `cargo run` (like examples) so cargo handles `LD_LIBRARY_PATH`,
+/// build checks, and dynamic linking automatically.
+pub fn build_cargo_app_command(
+    app_name: &str,
+    profile: &str,
+    port: Option<Port>,
+) -> Command {
+    let mut cmd = Command::new("cargo");
+    cmd.arg("run").arg("--bin").arg(app_name);
+
+    if profile == "release" {
+        cmd.arg("--release");
+    }
+
     set_brp_env_vars(&mut cmd, port);
+
     cmd
 }
 
@@ -812,8 +826,8 @@ impl LaunchConfigTrait for LaunchConfig<App> {
 
     fn set_port(&mut self, port: Port) { self.port = port; }
 
-    fn build_command(&self, target: &BevyTarget) -> Command {
-        build_app_command(&target.get_binary_path(self.profile()), Some(self.port))
+    fn build_command(&self, _target: &BevyTarget) -> Command {
+        build_cargo_app_command(&self.target_name, self.profile(), Some(self.port))
     }
 
     fn extra_log_info(&self, _target: &BevyTarget) -> Option<String> { None }
