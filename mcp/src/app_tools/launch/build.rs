@@ -61,35 +61,61 @@ const DYLIB_PATH_ENV_VAR: &str = "PATH";
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 const DYLIB_PATH_ENV_VAR: &str = "LD_LIBRARY_PATH";
 
-/// Make a directly-executed app binary able to find Bevy's shared library when it
-/// was built with the `dynamic_linking` (a.k.a. `dylib`) feature.
+/// Make a directly-executed app binary able to find the shared libraries it needs
+/// when built with the `dynamic_linking` (a.k.a. `dylib`) feature.
 ///
-/// The dylib (e.g. `libbevy_dylib-<hash>.so`) is placed in `target/<profile>/deps`,
-/// a sibling of the binary. `cargo run` sets up the loader path automatically, but
-/// since we execute the binary directly that directory isn't searched and the
-/// process fails to start. We prepend it to any existing loader search path.
+/// `cargo run` sets the loader path up automatically, but a direct execution does
+/// not, so we add the two directories cargo would:
+/// - `target/<profile>/deps` (sibling of the binary) — holds `libbevy_dylib-<hash>.so`.
+/// - the Rust toolchain's target lib dir (`rustc --print target-libdir`) — holds
+///   `libstd-<hash>.so`. Without it the process fails to start with
+///   `libstd-*.so: cannot open shared object file`.
 fn set_dylib_library_path(command: &mut Command, binary_path: &Path) {
-    if let Some(new_path) = dylib_search_path(binary_path, std::env::var_os(DYLIB_PATH_ENV_VAR)) {
+    let toolchain_libdir = rustc_target_libdir();
+    if let Some(new_path) = dylib_search_path(
+        binary_path,
+        toolchain_libdir.as_deref(),
+        std::env::var_os(DYLIB_PATH_ENV_VAR),
+    ) {
         command.env(DYLIB_PATH_ENV_VAR, new_path);
     }
 }
 
-/// Compute the loader search-path value for a directly-executed app `binary_path`,
-/// prepending the binary's sibling `deps` directory to any `existing` value.
+/// The active Rust toolchain's target lib dir, via `rustc --print target-libdir` —
+/// where `libstd-<hash>.so` lives for `dynamic_linking` builds. Returns `None` if
+/// `rustc` can't be run or prints nothing (the dylib path then omits it).
+fn rustc_target_libdir() -> Option<PathBuf> {
+    let output = Command::new("rustc")
+        .args(["--print", "target-libdir"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let path = String::from_utf8(output.stdout).ok()?;
+    let path = path.trim();
+    (!path.is_empty()).then(|| PathBuf::from(path))
+}
+
+/// Compute the loader search-path value for a directly-executed app `binary_path`:
+/// the binary's sibling `deps` dir, then the toolchain `target-libdir` (when known),
+/// then any `existing` value.
 ///
 /// Returns `None` if the path can't be derived (no parent directory) or the
 /// resulting value can't be encoded for the environment.
-fn dylib_search_path(binary_path: &Path, existing: Option<OsString>) -> Option<OsString> {
-    let deps_dir = binary_path.parent()?.join("deps");
-
-    match existing {
-        Some(existing) => {
-            let mut paths = vec![deps_dir];
-            paths.extend(std::env::split_paths(&existing));
-            std::env::join_paths(paths).ok()
-        },
-        None => Some(deps_dir.into_os_string()),
+fn dylib_search_path(
+    binary_path: &Path,
+    toolchain_libdir: Option<&Path>,
+    existing: Option<OsString>,
+) -> Option<OsString> {
+    let mut paths = vec![binary_path.parent()?.join("deps")];
+    if let Some(libdir) = toolchain_libdir {
+        paths.push(libdir.to_path_buf());
     }
+    if let Some(existing) = existing {
+        paths.extend(std::env::split_paths(&existing));
+    }
+    std::env::join_paths(paths).ok()
 }
 
 pub(super) fn setup_launch_logging(
@@ -285,24 +311,45 @@ mod tests {
     #[test]
     fn dylib_search_path_with_no_existing_value_is_just_deps_dir() {
         let binary = Path::new("/work/target/debug/my_app");
-        let result = dylib_search_path(binary, None);
+        let result = dylib_search_path(binary, None, None);
         assert_eq!(result, Some(OsString::from("/work/target/debug/deps")));
     }
 
     #[test]
-    fn dylib_search_path_prepends_deps_dir_and_preserves_existing() {
+    fn dylib_search_path_includes_toolchain_libdir_after_deps() {
+        let binary = Path::new("/work/target/debug/my_app");
+        let libdir = Path::new("/rust/lib");
+
+        let result = dylib_search_path(binary, Some(libdir), None).expect("should produce a value");
+
+        // deps first (freshly-built dylib wins), then the toolchain libdir (libstd).
+        let entries: Vec<PathBuf> = std::env::split_paths(&result).collect();
+        assert_eq!(
+            entries,
+            vec![
+                PathBuf::from("/work/target/debug/deps"),
+                PathBuf::from("/rust/lib"),
+            ]
+        );
+    }
+
+    #[test]
+    fn dylib_search_path_prepends_deps_and_libdir_then_preserves_existing() {
         let binary = Path::new("/work/target/release/my_app");
+        let libdir = Path::new("/rust/lib");
         let existing = std::env::join_paths(["/usr/lib", "/opt/lib"]).unwrap();
 
-        let result = dylib_search_path(binary, Some(existing)).expect("should produce a value");
+        let result =
+            dylib_search_path(binary, Some(libdir), Some(existing)).expect("should produce a value");
 
-        // The deps dir must come first so the freshly-built dylib wins, with the
-        // pre-existing entries retained after it.
+        // The deps dir and toolchain libdir come first, with the pre-existing
+        // entries retained after them.
         let entries: Vec<PathBuf> = std::env::split_paths(&result).collect();
         assert_eq!(
             entries,
             vec![
                 PathBuf::from("/work/target/release/deps"),
+                PathBuf::from("/rust/lib"),
                 PathBuf::from("/usr/lib"),
                 PathBuf::from("/opt/lib"),
             ]
@@ -311,6 +358,6 @@ mod tests {
 
     #[test]
     fn dylib_search_path_returns_none_when_binary_has_no_parent() {
-        assert_eq!(dylib_search_path(Path::new(""), None), None);
+        assert_eq!(dylib_search_path(Path::new(""), None, None), None);
     }
 }
