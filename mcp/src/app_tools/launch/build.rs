@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::fs::File;
 use std::path::Path;
 use std::path::PathBuf;
@@ -49,6 +50,45 @@ fn set_user_env_vars(command: &mut Command, env: Option<&HashMap<String, String>
         for (key, value) in env_vars {
             command.env(key, value);
         }
+    }
+}
+
+/// Name of the dynamic-loader search-path environment variable for the host OS.
+#[cfg(target_os = "macos")]
+const DYLIB_PATH_ENV_VAR: &str = "DYLD_LIBRARY_PATH";
+#[cfg(target_os = "windows")]
+const DYLIB_PATH_ENV_VAR: &str = "PATH";
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+const DYLIB_PATH_ENV_VAR: &str = "LD_LIBRARY_PATH";
+
+/// Make a directly-executed app binary able to find Bevy's shared library when it
+/// was built with the `dynamic_linking` (a.k.a. `dylib`) feature.
+///
+/// The dylib (e.g. `libbevy_dylib-<hash>.so`) is placed in `target/<profile>/deps`,
+/// a sibling of the binary. `cargo run` sets up the loader path automatically, but
+/// since we execute the binary directly that directory isn't searched and the
+/// process fails to start. We prepend it to any existing loader search path.
+fn set_dylib_library_path(command: &mut Command, binary_path: &Path) {
+    if let Some(new_path) = dylib_search_path(binary_path, std::env::var_os(DYLIB_PATH_ENV_VAR)) {
+        command.env(DYLIB_PATH_ENV_VAR, new_path);
+    }
+}
+
+/// Compute the loader search-path value for a directly-executed app `binary_path`,
+/// prepending the binary's sibling `deps` directory to any `existing` value.
+///
+/// Returns `None` if the path can't be derived (no parent directory) or the
+/// resulting value can't be encoded for the environment.
+fn dylib_search_path(binary_path: &Path, existing: Option<OsString>) -> Option<OsString> {
+    let deps_dir = binary_path.parent()?.join("deps");
+
+    match existing {
+        Some(existing) => {
+            let mut paths = vec![deps_dir];
+            paths.extend(std::env::split_paths(&existing));
+            std::env::join_paths(paths).ok()
+        },
+        None => Some(deps_dir.into_os_string()),
     }
 }
 
@@ -116,6 +156,7 @@ pub(super) fn build_app_command(
         command.args(user_arguments);
     }
     set_brp_env_vars(&mut command, port);
+    set_dylib_library_path(&mut command, binary_path);
     set_user_env_vars(&mut command, env);
     command
 }
@@ -233,4 +274,43 @@ pub(super) fn run_cargo_build(
     log_build_result(build_state, target_name, target_type);
 
     Ok(build_state)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+
+    #[test]
+    fn dylib_search_path_with_no_existing_value_is_just_deps_dir() {
+        let binary = Path::new("/work/target/debug/my_app");
+        let result = dylib_search_path(binary, None);
+        assert_eq!(result, Some(OsString::from("/work/target/debug/deps")));
+    }
+
+    #[test]
+    fn dylib_search_path_prepends_deps_dir_and_preserves_existing() {
+        let binary = Path::new("/work/target/release/my_app");
+        let existing = std::env::join_paths(["/usr/lib", "/opt/lib"]).unwrap();
+
+        let result = dylib_search_path(binary, Some(existing)).expect("should produce a value");
+
+        // The deps dir must come first so the freshly-built dylib wins, with the
+        // pre-existing entries retained after it.
+        let entries: Vec<PathBuf> = std::env::split_paths(&result).collect();
+        assert_eq!(
+            entries,
+            vec![
+                PathBuf::from("/work/target/release/deps"),
+                PathBuf::from("/usr/lib"),
+                PathBuf::from("/opt/lib"),
+            ]
+        );
+    }
+
+    #[test]
+    fn dylib_search_path_returns_none_when_binary_has_no_parent() {
+        assert_eq!(dylib_search_path(Path::new(""), None), None);
+    }
 }
