@@ -42,10 +42,18 @@ pub(super) fn launch_detached_process(
         new_command.arg(arg);
     }
 
-    // Set working directory and CARGO_MANIFEST_DIR
-    new_command
-        .current_dir(working_dir)
-        .env("CARGO_MANIFEST_DIR", working_dir);
+    // Set working directory. Only set CARGO_MANIFEST_DIR for a *direct binary*
+    // launch — when launching via `cargo`, cargo already provides it to the run
+    // target, and injecting it into cargo's environment leaks into build-script
+    // fingerprints (e.g. ring's `rerun-if-env-changed=CARGO_MANIFEST_DIR`),
+    // forcing a dependency recompile whenever the user alternates with `cargo run`.
+    new_command.current_dir(working_dir);
+    let launching_cargo = Path::new(command.get_program())
+        .file_stem()
+        .is_some_and(|stem| stem == "cargo");
+    if !launching_cargo {
+        new_command.env("CARGO_MANIFEST_DIR", working_dir);
+    }
 
     // Copy other environment variables
     for (key, value) in command.get_envs() {
