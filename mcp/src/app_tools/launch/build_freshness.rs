@@ -61,6 +61,18 @@ fn try_check_target_freshness(target: &BevyTarget, profile: &str) -> Result<Fres
     let dep_info_dir = dep_info_path
         .parent()
         .ok_or_else(|| Error::FileOrPathNotFound("Dep-info file has no parent directory".into()))?;
+
+    if let Some(other_output) =
+        foreign_workspace_output(&dep_info_contents, dep_info_dir, &target.workspace_root)
+    {
+        return Ok(FreshnessCheckResult::Stale(format!(
+            "binary belongs to another workspace: dep-info for {} names {}, which is outside {}",
+            binary_path.display(),
+            other_output.display(),
+            target.workspace_root.display()
+        )));
+    }
+
     let dependencies = parse_dep_info_dependencies(&dep_info_contents, dep_info_dir);
 
     if dependencies.is_empty() {
@@ -218,8 +230,91 @@ fn file_modified_time(path: &Path) -> Result<SystemTime> {
         })
 }
 
+/// The output path a dep-info file describes, when it lies outside `workspace_root`.
+///
+/// Cargo rewrites `target/<profile>/<name>.d` each time it uplifts the binary, and
+/// the path on the left of the rule is the uplift destination as *that* build
+/// computed it — `<its workspace root>/target/<profile>/<name>`. Workspaces that
+/// share one `target/` (git worktrees whose `target` is a symlink to the main
+/// checkout's, say) therefore take turns owning the one binary file, and the
+/// dep-info names whoever owns it now.
+///
+/// Comparing mtimes cannot see this: the sibling's binary is newer than every
+/// source file it lists, so the check reports fresh and the launch runs another
+/// workspace's build from this workspace's directory. When the recorded output
+/// path is outside the launching workspace, the binary is not this workspace's
+/// and the caller must build before launching.
+fn foreign_workspace_output(
+    contents: &str,
+    base_dir: &Path,
+    workspace_root: &Path,
+) -> Option<PathBuf> {
+    let (rule_target, _) = split_dep_info_rule(contents)?;
+    let declared_output = resolve_dep_info_path(rule_target.trim(), base_dir)?;
+    (!declared_output.starts_with(workspace_root)).then_some(declared_output)
+}
+
+/// Splits a dep-info rule into its output path and its dependency list.
+///
+/// A make rule ends its target at a `:`, but a path may contain one (a Windows
+/// drive letter, or simply a colon in a directory name), so the separator is the
+/// first unescaped `:` followed by whitespace or the end of the text.
+fn split_dep_info_rule(contents: &str) -> Option<(&str, &str)> {
+    let mut escaped = BackslashState::ReadingToken;
+
+    for (index, ch) in contents.char_indices() {
+        if escaped.is_escaped() {
+            escaped = BackslashState::ReadingToken;
+            continue;
+        }
+
+        match ch {
+            '\\' => escaped = BackslashState::Escaped,
+            ':' => {
+                let rest = &contents[index + ch.len_utf8()..];
+                if rest.chars().next().is_none_or(char::is_whitespace) {
+                    return Some((&contents[..index], rest));
+                }
+            },
+            _ => {},
+        }
+    }
+
+    None
+}
+
+/// Unescapes one dep-info path token and makes it absolute against `base_dir`.
+fn resolve_dep_info_path(token: &str, base_dir: &Path) -> Option<PathBuf> {
+    let mut unescaped = String::with_capacity(token.len());
+    let mut escaped = BackslashState::ReadingToken;
+
+    for ch in token.chars() {
+        if escaped.is_escaped() {
+            unescaped.push(ch);
+            escaped = BackslashState::ReadingToken;
+            continue;
+        }
+
+        match ch {
+            '\\' => escaped = BackslashState::Escaped,
+            _ => unescaped.push(ch),
+        }
+    }
+
+    if unescaped.is_empty() {
+        return None;
+    }
+
+    let path = PathBuf::from(unescaped);
+    Some(if path.is_absolute() {
+        path
+    } else {
+        base_dir.join(path)
+    })
+}
+
 fn parse_dep_info_dependencies(contents: &str, base_dir: &Path) -> Vec<PathBuf> {
-    let Some((_, dependency_text)) = contents.split_once(':') else {
+    let Some((_, dependency_text)) = split_dep_info_rule(contents) else {
         return Vec::new();
     };
 
@@ -280,7 +375,9 @@ mod tests {
 
     use super::FreshnessCheckResult;
     use super::check_target_freshness;
+    use super::foreign_workspace_output;
     use super::parse_dep_info_dependencies;
+    use super::split_dep_info_rule;
     use crate::app_tools::targets::BevyTarget;
     use crate::app_tools::targets::TargetType;
 
@@ -385,6 +482,107 @@ mod tests {
             FreshnessCheckResult::Stale(reason)
                 if reason.contains("dependency is newer than binary")
         ));
+    }
+
+    /// Two checkouts of the same package sharing one `target/` (git worktrees whose
+    /// `target` is a symlink to the main checkout's): the sibling built last, so the
+    /// binary and its dep-info are the sibling's. Every mtime says fresh; only the
+    /// recorded output path gives it away.
+    #[test]
+    fn returns_stale_when_binary_was_built_by_a_sibling_workspace() {
+        let temp_dir = tempdir().expect("temp dir");
+        let launching_root = temp_dir.path().join("worktree-b");
+        let sibling_root = temp_dir.path().join("worktree-a");
+        let manifest_path = launching_root.join("Cargo.toml");
+        let src_path = launching_root.join("src/main.rs");
+        let binary_path = launching_root.join("target/debug/demo");
+        let dep_info_path = launching_root.join("target/debug/demo.d");
+
+        fs::create_dir_all(src_path.parent().expect("src parent")).expect("create src dir");
+        fs::create_dir_all(binary_path.parent().expect("binary parent"))
+            .expect("create target dir");
+        fs::write(
+            &manifest_path,
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("write manifest");
+        fs::write(launching_root.join("Cargo.lock"), "# lock\n").expect("write lock");
+        fs::write(&src_path, "fn main() {}\n").expect("write source");
+
+        // The sibling's sources exist too, so the mtime comparison finds nothing
+        // missing and nothing newer than the binary.
+        let sibling_src = sibling_root.join("src/main.rs");
+        fs::create_dir_all(sibling_src.parent().expect("sibling src parent"))
+            .expect("create sibling src dir");
+        fs::write(&sibling_src, "fn main() {}\n").expect("write sibling source");
+
+        // The sibling's build is newer than every source file, here and there.
+        thread::sleep(Duration::from_millis(FILE_TIMESTAMP_ADVANCE_MS));
+        fs::write(&binary_path, "sibling binary").expect("write binary");
+        fs::write(
+            &dep_info_path,
+            format!(
+                "{}: {}\n",
+                sibling_root.join("target/debug/demo").display(),
+                sibling_root.join("src/main.rs").display()
+            ),
+        )
+        .expect("write dep info");
+
+        let target = test_target(&launching_root, &manifest_path, "demo");
+        let result = check_target_freshness(&target, "debug");
+        assert!(
+            matches!(
+                &result,
+                FreshnessCheckResult::Stale(reason)
+                    if reason.contains("belongs to another workspace")
+            ),
+            "expected stale, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn foreign_workspace_output_accepts_this_workspace() {
+        let contents = "/work/b/target/debug/demo: /work/b/src/main.rs";
+        assert_eq!(
+            foreign_workspace_output(contents, Path::new("/work/b/target/debug"), Path::new("/work/b")),
+            None
+        );
+    }
+
+    #[test]
+    fn foreign_workspace_output_is_not_fooled_by_a_shared_path_prefix() {
+        // `/work/b` is not a parent of `/work/bee`, even though the string is a prefix.
+        let contents = "/work/bee/target/debug/demo: /work/bee/src/main.rs";
+        assert_eq!(
+            foreign_workspace_output(contents, Path::new("/work/b/target/debug"), Path::new("/work/b")),
+            Some(PathBuf::from("/work/bee/target/debug/demo"))
+        );
+    }
+
+    #[test]
+    fn foreign_workspace_output_is_none_without_a_rule_separator() {
+        assert_eq!(
+            foreign_workspace_output("garbage with no rule", Path::new("/work/b/target/debug"), Path::new("/work/b")),
+            None
+        );
+    }
+
+    #[test]
+    fn split_dep_info_rule_keeps_a_windows_drive_letter_with_its_path() {
+        let (rule_target, dependencies) =
+            split_dep_info_rule(r"C:\work\target\debug\demo.exe: C:\work\src\main.rs")
+                .expect("should split");
+        assert_eq!(rule_target, r"C:\work\target\debug\demo.exe");
+        assert_eq!(dependencies.trim(), r"C:\work\src\main.rs");
+    }
+
+    #[test]
+    fn split_dep_info_rule_ignores_an_escaped_colon() {
+        let (rule_target, _) =
+            split_dep_info_rule(r"/work/odd\:name/demo: /work/odd\:name/src/main.rs")
+                .expect("should split");
+        assert_eq!(rule_target, r"/work/odd\:name/demo");
     }
 
     #[test]
