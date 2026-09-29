@@ -395,14 +395,14 @@ fn to_value<T: Serialize>(response: T) -> BrpResult {
 
 /// Resolve the `gamepad` parameter to a simulated gamepad entity
 fn simulated_gamepad(world: &World, bits: u64) -> Result<Entity, BrpError> {
-    let entity = Entity::try_from_bits(bits)
-        .ok_or_else(|| invalid_params(format!("{bits} is not an entity")))?;
-    if world.get::<SimulatedGamepad>(entity).is_none() {
-        return Err(invalid_params(format!(
-            "{entity} is not a simulated gamepad; create one with brp_extras/connect_gamepad"
-        )));
-    }
-    Ok(entity)
+    Entity::try_from_bits(bits)
+        .filter(|&entity| world.get::<SimulatedGamepad>(entity).is_some())
+        .ok_or_else(|| {
+            invalid_params(format!(
+                "Entity {bits} is not a simulated gamepad; create one with \
+                 brp_extras/connect_gamepad"
+            ))
+        })
 }
 
 #[cfg(test)]
@@ -581,6 +581,11 @@ mod tests {
         )
         .expect_err("not a simulated gamepad");
         assert_eq!(error.code, INVALID_PARAMS);
+        assert!(
+            error.message.contains(&other.to_string()),
+            "{}",
+            error.message
+        );
     }
 
     #[test]
