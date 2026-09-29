@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- Simulated gamepads: `connect_gamepad`, `send_gamepad_button`, `set_gamepad_axis` and `disconnect_gamepad` drive a pad the app treats as real, behind the default `gamepad` feature. Timed button releases run on the real clock
+
 ## [0.22.7] - 2026-09-23
 
 ### Fixed
