@@ -129,12 +129,18 @@ mod tests {
             "the key must be released on the real clock"
         );
         assert_eq!(releases[0].key_code, KeyCode::Backquote);
+        // It keeps its key one more frame, so a waiting tap of the same key
+        // does not go down in the frame of this release.
+        advance_real_clock(&mut app, 1);
         let pending = app
             .world_mut()
             .query::<&TimedKeyRelease>()
             .iter(app.world())
             .count();
-        assert_eq!(pending, 0, "the release entity is gone once it has fired");
+        assert_eq!(
+            pending, 0,
+            "the release entity is gone the frame after it fired"
+        );
     }
 
     /// A hold shorter than its duration is still held: the real clock is
@@ -158,6 +164,61 @@ mod tests {
             .filter(|event| event.state == ButtonState::Pressed)
             .cloned()
             .collect()
+    }
+
+    /// A second tap of a key that is still down waits for the first one's
+    /// release, and goes down a frame after it, so `ButtonInput` sees two
+    /// presses rather than one press with a release in the middle of it.
+    #[test]
+    fn a_press_of_a_held_key_waits_for_its_release() {
+        let mut app = app_with_paused_virtual_clock();
+        let tap = || Some(json!({ "keys": ["ArrowDown"] }));
+
+        assert!(send_keys_handler(In(tap()), app.world_mut()).is_ok());
+        assert!(send_keys_handler(In(tap()), app.world_mut()).is_ok());
+        assert_eq!(keyboard_presses(&app).len(), 1, "the second tap waits");
+
+        advance_real_clock(&mut app, DEFAULT_KEY_DURATION_MS);
+        assert_eq!(keyboard_releases(&app).len(), 1);
+        assert_eq!(
+            keyboard_presses(&app).len(),
+            1,
+            "not in the frame of the release"
+        );
+
+        advance_real_clock(&mut app, 1);
+        assert_eq!(keyboard_presses(&app).len(), 2, "the frame after it");
+
+        advance_real_clock(&mut app, DEFAULT_KEY_DURATION_MS);
+        assert_eq!(keyboard_releases(&app).len(), 2);
+        let states: Vec<ButtonState> = MessageCursor::default()
+            .read(app.world().resource::<Messages<KeyboardInput>>())
+            .map(|event| event.state)
+            .collect();
+        assert_eq!(
+            states,
+            [
+                ButtonState::Pressed,
+                ButtonState::Released,
+                ButtonState::Pressed,
+                ButtonState::Released
+            ]
+        );
+    }
+
+    /// Only the same key waits: a different key goes down at once.
+    #[test]
+    fn a_different_key_does_not_wait() {
+        let mut app = app_with_paused_virtual_clock();
+
+        assert!(
+            send_keys_handler(In(Some(json!({ "keys": ["ArrowDown"] }))), app.world_mut()).is_ok()
+        );
+        assert!(
+            send_keys_handler(In(Some(json!({ "keys": ["ArrowUp"] }))), app.world_mut()).is_ok()
+        );
+
+        assert_eq!(keyboard_presses(&app).len(), 2);
     }
 
     /// A press from `send_keys` names the primary window, the way a `winit`
