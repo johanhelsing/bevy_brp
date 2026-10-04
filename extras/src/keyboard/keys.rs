@@ -55,10 +55,6 @@ pub(super) enum KeyPhase {
     Released,
 }
 
-/// Arrival counter for [`TimedKeyRelease::order`].
-#[derive(Resource, Default)]
-struct KeyRequestCount(u64);
-
 /// Request structure for `send_keys`
 #[derive(Debug, Deserialize)]
 pub(super) struct SendKeysRequest {
@@ -78,6 +74,11 @@ pub(super) struct SendKeysResponse {
     pub(super) keys_sent:   Vec<String>,
     /// Duration in milliseconds the keys were held
     pub(super) duration_ms: u32,
+    /// The keys did not go down yet: an earlier request still holds one of
+    /// them, and they press a frame after its release. A state read right
+    /// after this answer does not show them.
+    #[serde(default)]
+    pub(super) queued:      bool,
 }
 
 const fn default_duration() -> u32 { DEFAULT_KEY_DURATION_MS }
@@ -149,12 +150,24 @@ pub(crate) fn send_keys_handler(In(params): In<Option<Value>>, world: &mut World
 
     // Press now, addressed to the primary window, unless an earlier request
     // still holds one of these keys: then wait for its release.
+    let mut queued = false;
     if !wrappers.is_empty() {
-        let busy = world
+        let pending: Vec<(u64, bool)> = world
             .query::<&TimedKeyRelease>()
             .iter(world)
-            .any(|other| other.keys.iter().any(|key| wrappers.contains(key)));
-        let phase = if busy {
+            .map(|other| {
+                let shares_a_key = other.keys.iter().any(|key| wrappers.contains(key));
+                (other.order, shares_a_key)
+            })
+            .collect();
+        queued = pending.iter().any(|&(_, shares_a_key)| shares_a_key);
+        // After every pending request, so waiting requests keep their arrival order.
+        let order = pending
+            .iter()
+            .map(|&(order, _)| order + 1)
+            .max()
+            .unwrap_or(0);
+        let phase = if queued {
             KeyPhase::Waiting
         } else {
             let window = events::primary_window_entity(world);
@@ -163,9 +176,6 @@ pub(crate) fn send_keys_handler(In(params): In<Option<Value>>, world: &mut World
             }
             KeyPhase::Held
         };
-        let mut count = world.get_resource_or_insert_with(KeyRequestCount::default);
-        let order = count.0;
-        count.0 += 1;
         world.spawn(TimedKeyRelease {
             keys: wrappers,
             timer: Timer::new(
@@ -178,9 +188,10 @@ pub(crate) fn send_keys_handler(In(params): In<Option<Value>>, world: &mut World
     }
 
     Ok(json!(SendKeysResponse {
-        success:     true,
-        keys_sent:   valid_key_strings,
+        success: true,
+        keys_sent: valid_key_strings,
         duration_ms: request.duration_ms,
+        queued,
     }))
 }
 

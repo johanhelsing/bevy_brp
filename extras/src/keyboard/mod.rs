@@ -174,8 +174,10 @@ mod tests {
         let mut app = app_with_paused_virtual_clock();
         let tap = || Some(json!({ "keys": ["ArrowDown"] }));
 
-        assert!(send_keys_handler(In(tap()), app.world_mut()).is_ok());
-        assert!(send_keys_handler(In(tap()), app.world_mut()).is_ok());
+        let first = send_keys_handler(In(tap()), app.world_mut()).expect("first tap");
+        let second = send_keys_handler(In(tap()), app.world_mut()).expect("second tap");
+        assert_eq!(first["queued"], false);
+        assert_eq!(second["queued"], true, "the answer says the press is late");
         assert_eq!(keyboard_presses(&app).len(), 1, "the second tap waits");
 
         advance_real_clock(&mut app, DEFAULT_KEY_DURATION_MS);
