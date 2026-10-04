@@ -23,14 +23,41 @@ use crate::brp_request::EmptyParamsPolicy;
 use crate::constants::METHOD_SEND_KEYS;
 use crate::window_event;
 
-/// Component that tracks keys that need to be released after a duration
+/// One `send_keys` request: its keys, from the press until a frame after the release.
+///
+/// A request for a key another request still holds waits its turn instead of
+/// pressing at once. A real key cannot go down while it is down: Bevy's
+/// `ButtonInput` would see the second press as no change and the first
+/// release would end both, so a quick second tap of the same key would be
+/// lost. Requests for the same key therefore press in the order they arrived,
+/// each one frame after the previous release, so the release and the next
+/// press reach `ButtonInput` in different frames.
 #[derive(Component)]
 pub(super) struct TimedKeyRelease {
     /// The key code wrappers to release (stores wrapper for text field generation)
     pub(super) keys:  Vec<KeyCodeWrapper>,
-    /// Timer tracking the remaining duration
+    /// Timer tracking the remaining duration, started when the keys go down
     pub(super) timer: Timer,
+    /// Where the request is between its press and its release
+    pub(super) phase: KeyPhase,
+    /// Arrival order, so that waiting requests press first come, first served
+    pub(super) order: u64,
 }
+
+/// Where a [`TimedKeyRelease`] is in its press-hold-release cycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum KeyPhase {
+    /// Another request holds one of its keys; not pressed yet.
+    Waiting,
+    /// Pressed, released when the timer finishes.
+    Held,
+    /// Released this frame; despawned next frame, which frees its keys.
+    Released,
+}
+
+/// Arrival counter for [`TimedKeyRelease::order`].
+#[derive(Resource, Default)]
+struct KeyRequestCount(u64);
 
 /// Request structure for `send_keys`
 #[derive(Debug, Deserialize)]
@@ -101,21 +128,33 @@ pub(crate) fn send_keys_handler(In(params): In<Option<Value>>, world: &mut World
         )));
     }
 
-    // Always send press events first, addressed to the primary window
-    let window = events::primary_window_entity(world);
-    let press_events = events::create_keyboard_events(&wrappers, ButtonState::Pressed, window);
-    for event in press_events {
-        window_event::write_input_event(world, event);
-    }
-
-    // Always spawn an entity to handle the timed release
+    // Press now, addressed to the primary window, unless an earlier request
+    // still holds one of these keys: then wait for its release.
     if !wrappers.is_empty() {
+        let busy = world
+            .query::<&TimedKeyRelease>()
+            .iter(world)
+            .any(|other| other.keys.iter().any(|key| wrappers.contains(key)));
+        let phase = if busy {
+            KeyPhase::Waiting
+        } else {
+            let window = events::primary_window_entity(world);
+            for event in events::create_keyboard_events(&wrappers, ButtonState::Pressed, window) {
+                window_event::write_input_event(world, event);
+            }
+            KeyPhase::Held
+        };
+        let mut count = world.get_resource_or_insert_with(KeyRequestCount::default);
+        let order = count.0;
+        count.0 += 1;
         world.spawn(TimedKeyRelease {
-            keys:  wrappers,
+            keys: wrappers,
             timer: Timer::new(
                 Duration::from_millis(u64::from(request.duration_ms)),
                 TimerMode::Once,
             ),
+            phase,
+            order,
         });
     }
 
@@ -129,7 +168,8 @@ pub(crate) fn send_keys_handler(In(params): In<Option<Value>>, world: &mut World
     )
 }
 
-/// System that processes timed key releases
+/// System that processes timed key releases, and presses the requests that
+/// were waiting for them.
 ///
 /// The hold runs on `Time<Real>`, not the default (virtual) clock: apps pause
 /// or scale the virtual clock (a title screen, an editor pause, a replay), and
@@ -143,20 +183,45 @@ pub(super) fn process_timed_key_releases(
     mut window_events: MessageWriter<WindowEvent>,
 ) {
     let window = primary_window.single().unwrap_or(Entity::PLACEHOLDER);
-    for (entity, mut timed_release) in &mut query {
-        timed_release.timer.tick(time.delta());
-
-        if timed_release.timer.is_finished() {
-            // Send release events for all keys (text is None for release events)
-            let release_events =
-                events::create_keyboard_events(&timed_release.keys, ButtonState::Released, window);
-            for event in release_events {
-                window_events.write(WindowEvent::from(event.clone()));
-                keyboard_events.write(event);
-            }
-
-            // Remove the component after releasing
-            commands.entity(entity).despawn();
+    let mut send = |keys: &[KeyCodeWrapper], state: ButtonState| {
+        // Text is only set on presses
+        for event in events::create_keyboard_events(keys, state, window) {
+            window_events.write(WindowEvent::from(event.clone()));
+            keyboard_events.write(event);
         }
+    };
+
+    // Keys down, or released this frame: a waiting request for one of them
+    // must not press yet.
+    let mut busy: Vec<KeyCodeWrapper> = Vec::new();
+    let mut waiting = Vec::new();
+    for (entity, mut timed_release) in &mut query {
+        match timed_release.phase {
+            KeyPhase::Released => {
+                commands.entity(entity).despawn();
+            },
+            KeyPhase::Held => {
+                timed_release.timer.tick(time.delta());
+                if timed_release.timer.is_finished() {
+                    send(&timed_release.keys, ButtonState::Released);
+                    timed_release.phase = KeyPhase::Released;
+                }
+                busy.extend(&timed_release.keys);
+            },
+            KeyPhase::Waiting => waiting.push((timed_release.order, entity)),
+        }
+    }
+
+    waiting.sort_unstable();
+    for (_, entity) in waiting {
+        let Ok((_, mut timed_release)) = query.get_mut(entity) else {
+            continue;
+        };
+        if !timed_release.keys.iter().any(|key| busy.contains(key)) {
+            send(&timed_release.keys, ButtonState::Pressed);
+            timed_release.phase = KeyPhase::Held;
+        }
+        // Pressed now or still waiting, its keys are taken for this frame.
+        busy.extend(&timed_release.keys);
     }
 }
