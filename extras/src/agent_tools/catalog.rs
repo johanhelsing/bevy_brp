@@ -78,7 +78,8 @@ fn validate_backing_method(
     remote_methods: &RemoteMethods,
 ) -> BrpResult<()> {
     match remote_methods.get(tool.method) {
-        Some(RemoteMethodSystemId::Instant(_)) => Ok(()),
+        // A deferred method answers each request once, as an instant one does.
+        Some(RemoteMethodSystemId::Instant(_) | RemoteMethodSystemId::Deferred(_)) => Ok(()),
         Some(RemoteMethodSystemId::Watching(_)) => Err(backing_method_error(
             tool,
             BACKING_METHOD_WATCHING_REASON,

@@ -148,7 +148,8 @@ For each request, the handler:
 
 1. Reads the passive registered-metadata resource.
 2. Sorts records by agent-facing `name`.
-3. Verifies that every backing method exists in the live `RemoteMethods` resource and is instant.
+3. Verifies that every backing method exists in the live `RemoteMethods` resource and is instant
+   or deferred (one answer per request; a deferred method may send it in a later frame).
 4. Serializes the complete version-1 catalog.
 
 Validation is all-or-error. One missing or watching method prevents a partial catalog from being
