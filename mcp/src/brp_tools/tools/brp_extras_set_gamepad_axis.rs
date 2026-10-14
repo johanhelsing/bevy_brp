@@ -8,6 +8,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::brp_tools::Port;
+use crate::brp_tools::gamepad::GamepadAxisWrapper;
 
 /// Parameters for the `brp_extras/set_gamepad_axis` tool
 #[derive(Clone, Deserialize, Serialize, JsonSchema, ParamStruct)]
@@ -15,8 +16,8 @@ pub struct SetGamepadAxisParams {
     /// Gamepad entity returned by `brp_extras_connect_gamepad`
     pub gamepad: u64,
 
-    /// Axis name, a Bevy `GamepadAxis` variant such as `LeftStickX` or `RightZ`
-    pub axis: String,
+    /// Axis to set, such as `LeftStickX` or `RightZ`
+    pub axis: GamepadAxisWrapper,
 
     /// Value in [-1.0, 1.0]; the axis stays there until set again
     pub value: f32,

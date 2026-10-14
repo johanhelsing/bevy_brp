@@ -95,6 +95,9 @@
 //! - `camera` (u64, optional): active camera viewport, or the camera used for entity capture
 //! - `padding` (u32, optional): physical pixels added around entity bounds; requires `entity` and
 //!   defaults to zero
+//! - `rect` (object, optional): `{x, y, width, height}` (u32) crop in physical target coordinates
+//!   for a full-window or camera capture; it must lie inside the primary window or the camera's
+//!   physical viewport and is rejected with `entity`
 //!
 //! AABB capture projects the selected entity's [`Aabb`](bevy::camera::primitives::Aabb) through
 //! the selected camera. With the default `ui` feature, complete Bevy UI computed components take
@@ -105,9 +108,15 @@
 //! 0.19 `bevy_remote` brings that family transitively through `bevy_dev_tools`. Both modes crop the
 //! complete composited target, so overlapping content and post-processing remain visible. With
 //! neither `camera` nor `entity`, the method captures the primary window. With only `camera`, it
-//! captures that camera's physical viewport. The method never resolves names or descendants. If
-//! `camera` is omitted for AABB capture, exactly one active, initialized camera with a
-//! screenshot-capable target must exist.
+//! captures that camera's physical viewport. The method never resolves names. An entity without
+//! its own `Aabb` crops to the union of the projected AABBs of its visible descendants, reported as
+//! `bounds_kind: "hierarchy"`. If `camera` is omitted for AABB capture, exactly one active,
+//! initialized camera with a screenshot-capable target must exist.
+//!
+//! The capture slot frees when the response is delivered, so a client may send the same request
+//! again, back to back, as soon as it has the first response. Bevy Remote gives a call no identity,
+//! so identical calls in the delivery frame and one in the next frame are treated as the delivered
+//! call's own repeat. `brp_extras/screenshot+watch` is not supported.
 //!
 //! Requires Bevy's `png` feature. Calls fail before enqueueing when PNG support is unavailable.
 //!
@@ -151,12 +160,17 @@
 //! - `name` (string, optional): name reported for the pad
 //!
 //! ### `brp_extras/send_gamepad_button`
-//! Sets a button's value on a simulated gamepad.
+//! Taps a button on a simulated gamepad. The button is seen down for at least one frame.
 //! - `gamepad` (u64, required): entity from `connect_gamepad`
 //! - `button` (string, required)
-//! - `value` (f32, optional, default: 1.0): analog value in `[0.0, 1.0]`; `0.0` releases
-//! - `duration_ms` (u32, optional, max: 60000): release after this long on the real clock, so it
-//!   works while the app pauses its virtual clock. Omitted, the button stays until set again
+//! - `duration_ms` (u32, optional, default: 100, max: 60000): release after this long on the real
+//!   clock, so it works while the app pauses its virtual clock
+//!
+//! ### `brp_extras/set_gamepad_button`
+//! Sets a button's analog value until changed again. A value of `0.0` releases it.
+//! - `gamepad` (u64, required): entity from `connect_gamepad`
+//! - `button` (string, required)
+//! - `value` (f32, required): analog value in `[0.0, 1.0]`
 //!
 //! ### `brp_extras/set_gamepad_axis`
 //! Sets an axis on a simulated gamepad. Axes stay where they are put.
@@ -166,6 +180,7 @@
 //!
 //! ### `brp_extras/disconnect_gamepad`
 //! Disconnects a simulated gamepad. Bevy removes its `Gamepad` component, as for a real pad.
+//! Later input calls on that entity fail; connect a new pad to send more input.
 //! - `gamepad` (u64, required)
 //!
 //! ## Mouse
@@ -236,6 +251,7 @@
 //! rules and the BRP error data returned for a rejected entry.
 
 mod agent_tools;
+mod brp_request;
 mod constants;
 #[cfg(feature = "diagnostics")]
 mod diagnostics;

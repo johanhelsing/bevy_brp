@@ -33,6 +33,8 @@ pub(crate) const METHOD_SEND_KEYS: &str = "send_keys";
 pub(crate) const METHOD_SEND_MOUSE_BUTTON: &str = "send_mouse_button";
 #[cfg(feature = "gamepad")]
 pub(crate) const METHOD_SET_GAMEPAD_AXIS: &str = "set_gamepad_axis";
+#[cfg(feature = "gamepad")]
+pub(crate) const METHOD_SET_GAMEPAD_BUTTON: &str = "set_gamepad_button";
 pub(crate) const METHOD_SET_WINDOW_TITLE: &str = "set_window_title";
 pub(crate) const METHOD_SHUTDOWN: &str = "shutdown";
 pub(crate) const METHOD_TYPE_TEXT: &str = "type_text";
@@ -43,6 +45,17 @@ pub(crate) const BRP_EXTRAS_PORT_ENV_VAR: &str = "BRP_EXTRAS_PORT";
 
 // error messages
 pub(crate) const MISSING_REQUEST_PARAMETERS_MESSAGE: &str = "Missing request parameters";
+
+// gamepad constants
+/// Default hold for a timed button press
+#[cfg(feature = "gamepad")]
+pub(crate) const DEFAULT_GAMEPAD_DURATION_MS: u32 = 100;
+/// Maximum hold for a timed button press
+#[cfg(feature = "gamepad")]
+pub(crate) const MAX_GAMEPAD_DURATION_MS: u32 = 60_000;
+/// Name given to every simulated gamepad, as the OS name of a real one
+#[cfg(feature = "gamepad")]
+pub(crate) const SIMULATED_GAMEPAD_NAME: &str = "Simulated gamepad (BRP)";
 
 // network constants
 /// Default port for remote control connections
@@ -110,6 +123,8 @@ pub(crate) const RESPONSE_Y_FIELD: &str = "y";
 #[cfg(not(target_arch = "wasm32"))]
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) const SCREENSHOT_BOUNDS_KIND_AABB: &str = "aabb";
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) const SCREENSHOT_BOUNDS_KIND_HIERARCHY: &str = "hierarchy";
 #[cfg(all(feature = "ui", not(target_arch = "wasm32")))]
 pub(crate) const SCREENSHOT_BOUNDS_KIND_UI: &str = "ui";
 #[cfg(not(target_arch = "wasm32"))]
